@@ -1,0 +1,252 @@
+-- Hotfix: Up Next Review / spaced repetition data on daily plan
+-- 1) USP_GET_DAILY_PLAN_FOR_DATE — join USER_TOPIC_PROGRESS + theory for REVIEW
+-- 2) USP_UPDATE_DAILY_PLAN_STATUS — advance NEXTREVIEWDATE when REVIEW is completed
+USE [LEARNING_SERVICE]
+GO
+
+CREATE OR ALTER PROCEDURE [dbo].[USP_GET_DAILY_PLAN_FOR_DATE]
+(
+    @USERID INT,
+    @PLANDATE DATE = NULL,
+    @PLANID INT = NULL
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF @PLANID IS NULL AND @PLANDATE IS NULL
+    BEGIN
+        SELECT
+            1 AS ErrorCode,
+            'MISSING_PARAMS' AS ErrorType,
+            'Either planDate or planId is required' AS ErrorMessage;
+        RETURN;
+    END
+
+    SELECT
+        DLP.PLANID,
+        DLP.PLANDATE,
+        DLP.PLANTYPE,
+        DLP.PLANSLOT,
+        DLP.STATUS,
+        DLP.TOPICID,
+        TM.TOPICNAME,
+        TM.TOPICKEY,
+        LP.PATHNAME,
+        LP.PATHEMOJI,
+        DLP.CONTENTID,
+        CI.TITLE AS CONTENTTITLE,
+        CI.CONTENTTYPE,
+        CI.EXTERNALURL,
+        CI.PLATFORMCODE,
+        CI.DIFFICULTY,
+        COALESCE(CI.ESTIMATEDMINUTES, 10) AS ESTIMATEDMINUTES,
+        CASE
+            WHEN DLP.PLANSLOT IN (N'THEORY', N'REVIEW', N'RECAP') THEN TM.THEORYMARKDOWN
+            ELSE NULL
+        END AS THEORYMARKDOWN,
+        DLP.QUIZREQUIRED,
+        DLP.QUIZPASSED,
+        DLP.QUIZSCOREPERCENT,
+        DLP.COMPLETEDAT,
+        DLP.DAYID,
+        -- Spaced repetition (USER_TOPIC_PROGRESS)
+        UTP.PROGRESSID,
+        UTP.LEITNERBOX,
+        UTP.MASTERYLEVEL,
+        UTP.NEXTREVIEWDATE,
+        UTP.ATTEMPTCOUNT,
+        UTP.LASTQUIZSCORE,
+        UTP.CONTENTINDEX,
+        UTP.LASTATTEMPTEDAT,
+        CASE UTP.LEITNERBOX
+            WHEN 1 THEN 1
+            WHEN 2 THEN 3
+            WHEN 3 THEN 7
+            WHEN 4 THEN 14
+            ELSE 1
+        END AS REVIEWINTERVALDAYS
+    FROM DAILY_LEARNING_PLAN DLP
+    INNER JOIN TOPIC_MASTER TM ON DLP.TOPICID = TM.TOPICID
+    INNER JOIN LEARNING_PATH_MASTER LP ON TM.PATHID = LP.PATHID
+    LEFT JOIN CONTENT_ITEM CI ON DLP.CONTENTID = CI.CONTENTID
+    LEFT JOIN USER_TOPIC_PROGRESS UTP
+        ON UTP.USERID = DLP.USERID
+       AND UTP.TOPICID = DLP.TOPICID
+    WHERE DLP.USERID = @USERID
+      AND (@PLANID IS NULL OR DLP.PLANID = @PLANID)
+      AND (@PLANDATE IS NULL OR DLP.PLANDATE = @PLANDATE)
+    ORDER BY
+        CASE DLP.PLANSLOT
+            WHEN 'REVIEW' THEN 1
+            WHEN 'RECAP' THEN 2
+            WHEN 'THEORY' THEN 3
+            WHEN 'PRACTICE' THEN 4
+            WHEN 'QUIZ' THEN 5
+            ELSE 6
+        END;
+END
+GO
+
+CREATE OR ALTER PROCEDURE [dbo].[USP_UPDATE_DAILY_PLAN_STATUS]
+(
+    @USERID INT,
+    @PLANID INT,
+    @NEWSTATUS NVARCHAR(20)
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @CURRENTSTATUS NVARCHAR(20);
+    DECLARE @PLANOWNERID INT;
+    DECLARE @PLANSLOT NVARCHAR(20);
+    DECLARE @PLANTYPE NVARCHAR(20);
+    DECLARE @TOPICID INT;
+    DECLARE @PLANDATE DATE;
+
+    SELECT
+        @PLANOWNERID = USERID,
+        @CURRENTSTATUS = STATUS,
+        @PLANSLOT = PLANSLOT,
+        @PLANTYPE = PLANTYPE,
+        @TOPICID = TOPICID,
+        @PLANDATE = PLANDATE
+    FROM DAILY_LEARNING_PLAN
+    WHERE PLANID = @PLANID;
+
+    IF @PLANOWNERID IS NULL
+    BEGIN
+        SELECT
+            1 AS ErrorCode,
+            'PLAN_NOT_FOUND' AS ErrorType,
+            'Plan item not found' AS ErrorMessage;
+        RETURN;
+    END
+
+    IF @PLANOWNERID != @USERID
+    BEGIN
+        SELECT
+            2 AS ErrorCode,
+            'UNAUTHORIZED' AS ErrorType,
+            'This plan does not belong to the user' AS ErrorMessage;
+        RETURN;
+    END
+
+    IF @CURRENTSTATUS = 'COMPLETED'
+    BEGIN
+        SELECT
+            3 AS ErrorCode,
+            'ALREADY_COMPLETED' AS ErrorType,
+            'This plan item is already completed' AS ErrorMessage;
+        RETURN;
+    END
+
+    IF @CURRENTSTATUS = 'PENDING' AND @NEWSTATUS NOT IN ('IN_PROGRESS', 'SKIPPED')
+    BEGIN
+        SELECT
+            4 AS ErrorCode,
+            'INVALID_TRANSITION' AS ErrorType,
+            'From PENDING, status can only move to IN_PROGRESS or SKIPPED' AS ErrorMessage;
+        RETURN;
+    END
+
+    IF @CURRENTSTATUS = 'IN_PROGRESS' AND @NEWSTATUS NOT IN ('COMPLETED', 'SKIPPED')
+    BEGIN
+        SELECT
+            4 AS ErrorCode,
+            'INVALID_TRANSITION' AS ErrorType,
+            'From IN_PROGRESS, status can only move to COMPLETED or SKIPPED' AS ErrorMessage;
+        RETURN;
+    END
+
+    UPDATE DAILY_LEARNING_PLAN
+    SET STATUS = @NEWSTATUS,
+        COMPLETEDAT = CASE WHEN @NEWSTATUS = 'COMPLETED' THEN SYSUTCDATETIME() ELSE NULL END,
+        SKIPPEDAT = CASE WHEN @NEWSTATUS = 'SKIPPED' THEN SYSUTCDATETIME() ELSE NULL END,
+        UPDATEDDATE = SYSUTCDATETIME()
+    WHERE PLANID = @PLANID;
+
+    -- When a REVIEW slot is completed (content review without quiz),
+    -- advance NEXTREVIEWDATE using current Leitner interval so the queue moves.
+    -- Quiz submit remains the path that promotes/demotes boxes via score.
+    DECLARE @NEWBOX INT = NULL;
+    DECLARE @NEWMASTERY NVARCHAR(20) = NULL;
+    DECLARE @NEWREVIEWDATE DATE = NULL;
+
+    IF @NEWSTATUS = 'COMPLETED'
+       AND (@PLANSLOT = N'REVIEW' OR @PLANTYPE = N'REVIEW')
+       AND @TOPICID IS NOT NULL
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM USER_TOPIC_PROGRESS
+            WHERE USERID = @USERID AND TOPICID = @TOPICID
+        )
+        BEGIN
+            INSERT INTO USER_TOPIC_PROGRESS (USERID, TOPICID)
+            VALUES (@USERID, @TOPICID);
+        END
+
+        DECLARE @CURRENTBOX INT;
+        DECLARE @CURRENTMASTERY NVARCHAR(20);
+
+        SELECT
+            @CURRENTBOX = LEITNERBOX,
+            @CURRENTMASTERY = MASTERYLEVEL
+        FROM USER_TOPIC_PROGRESS
+        WHERE USERID = @USERID AND TOPICID = @TOPICID;
+
+        SET @NEWBOX = ISNULL(@CURRENTBOX, 1);
+        SET @NEWMASTERY = ISNULL(@CURRENTMASTERY, N'BEGINNER');
+
+        SET @NEWREVIEWDATE = DATEADD(
+            DAY,
+            CASE @NEWBOX
+                WHEN 1 THEN 1
+                WHEN 2 THEN 3
+                WHEN 3 THEN 7
+                WHEN 4 THEN 14
+                ELSE 1
+            END,
+            ISNULL(@PLANDATE, CAST(SYSUTCDATETIME() AS DATE))
+        );
+
+        UPDATE USER_TOPIC_PROGRESS
+        SET NEXTREVIEWDATE = @NEWREVIEWDATE,
+            LASTATTEMPTEDAT = SYSUTCDATETIME(),
+            UPDATEDDATE = SYSUTCDATETIME()
+        WHERE USERID = @USERID AND TOPICID = @TOPICID;
+    END
+
+    -- Soft-skip: push due date by 1 day so overdue reviews do not loop immediately
+    IF @NEWSTATUS = 'SKIPPED'
+       AND (@PLANSLOT = N'REVIEW' OR @PLANTYPE = N'REVIEW')
+       AND @TOPICID IS NOT NULL
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM USER_TOPIC_PROGRESS
+            WHERE USERID = @USERID AND TOPICID = @TOPICID
+        )
+        BEGIN
+            UPDATE USER_TOPIC_PROGRESS
+            SET NEXTREVIEWDATE = DATEADD(DAY, 1, ISNULL(@PLANDATE, CAST(SYSUTCDATETIME() AS DATE))),
+                UPDATEDDATE = SYSUTCDATETIME()
+            WHERE USERID = @USERID AND TOPICID = @TOPICID;
+
+            SELECT
+                @NEWBOX = LEITNERBOX,
+                @NEWMASTERY = MASTERYLEVEL,
+                @NEWREVIEWDATE = NEXTREVIEWDATE
+            FROM USER_TOPIC_PROGRESS
+            WHERE USERID = @USERID AND TOPICID = @TOPICID;
+        END
+    END
+
+    SELECT
+        0 AS ErrorCode,
+        'SUCCESS' AS Status,
+        @NEWBOX AS NewLeitnerBox,
+        @NEWMASTERY AS NewMasteryLevel,
+        @NEWREVIEWDATE AS NextReviewDate;
+END
+GO

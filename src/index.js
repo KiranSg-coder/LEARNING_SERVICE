@@ -1,7 +1,17 @@
 require("dotenv").config();
 const express = require("express");
+const cors = require("cors");
 const app = express();
 const sequelizeConnection = require("./config/database");
+
+const corsOrigin =
+  process.env.CORS_ORIGIN === "*"
+    ? true
+    : (process.env.CORS_ORIGIN || "http://localhost:5173")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+app.use(cors({ origin: corsOrigin, credentials: true }));
 
 const catalogRoutes = require("./routes/catalog.routes");
 const profileRoutes = require("./routes/profile.routes");
@@ -12,6 +22,13 @@ const aiRoutes = require("./routes/ai.routes");
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+app.use((req, _res, next) => {
+  if (req.url === "/learning" || req.url.startsWith("/learning/")) {
+    req.url = req.url.slice("/learning".length) || "/";
+  }
+  next();
+});
 
 app.get("/", (req, res) => {
   res.send("Learning service running.....");
@@ -33,7 +50,7 @@ sequelizeConnection
     return sequelizeConnection.sync();
   })
   .then(() => {
-    const PORT = process.env.PORT || 6007;
+    const PORT = process.env.PORT || 6009;
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
 

@@ -1,6 +1,8 @@
 const { QueryTypes } = require("sequelize");
 const sequelize = require("../config/database");
 const { getLearningLimits } = require("../utils/learningEntitlements");
+const eventPublisher = require("../utils/eventPublisher");
+const { EVENT_TYPES, EVENT_CATEGORIES } = require("../config/eventTypes");
 
 function formatPlanDateForSql(value) {
   if (value == null || value === "") {
@@ -11,6 +13,32 @@ function formatPlanDateForSql(value) {
   }
   const s = String(value);
   return s.includes("T") ? s.split("T")[0] : s.slice(0, 10);
+}
+
+function isGuidedReviewSlot(row) {
+  const slot = String(row?.planSlot || row?.PLANSLOT || "").toUpperCase();
+  const type = String(row?.planType || row?.PLANTYPE || "").toUpperCase();
+  return slot === "REVIEW" || type === "REVIEW";
+}
+
+async function publishTopicProgress(userId, topicUpdate, extra = {}) {
+  if (!topicUpdate || !userId) return;
+  const topicId = extra.topicId != null ? Number(extra.topicId) : null;
+  if (!topicId) return;
+  await eventPublisher.publish(
+    EVENT_TYPES.LEARNING_TOPIC_PROGRESS_UPDATED,
+    EVENT_CATEGORIES.LEARNING,
+    {
+      userId: Number(userId),
+      topicId,
+      title: extra.title || null,
+      leitnerBox: topicUpdate.newLeitnerBox ?? topicUpdate.leitnerBox ?? null,
+      nextReviewDate: topicUpdate.nextReviewDate || null,
+      masteryLevel: topicUpdate.newMasteryLevel || topicUpdate.masteryLevel || null,
+      updatedAt: new Date().toISOString(),
+    },
+    { entityType: "TOPIC", entityId: String(topicId) }
+  );
 }
 
 function mapSqlRowsToPlan(planRows) {
@@ -38,6 +66,16 @@ function mapSqlRowsToPlan(planRows) {
     quizScorePercent: r.QUIZSCOREPERCENT,
     completedAt: r.COMPLETEDAT,
     dayId: r.DAYID != null ? Number(r.DAYID) : null,
+    // Spaced repetition (joined from USER_TOPIC_PROGRESS)
+    progressId: r.PROGRESSID != null ? Number(r.PROGRESSID) : null,
+    leitnerBox: r.LEITNERBOX != null ? Number(r.LEITNERBOX) : null,
+    masteryLevel: r.MASTERYLEVEL ?? null,
+    nextReviewDate: r.NEXTREVIEWDATE ?? null,
+    attemptCount: r.ATTEMPTCOUNT != null ? Number(r.ATTEMPTCOUNT) : null,
+    lastQuizScore: r.LASTQUIZSCORE != null ? Number(r.LASTQUIZSCORE) : null,
+    contentIndex: r.CONTENTINDEX != null ? Number(r.CONTENTINDEX) : null,
+    lastAttemptedAt: r.LASTATTEMPTEDAT ?? null,
+    reviewIntervalDays: r.REVIEWINTERVALDAYS != null ? Number(r.REVIEWINTERVALDAYS) : null,
   }));
 }
 
@@ -108,14 +146,23 @@ const getTodayPlan = async (req, res) => {
     }
 
     const plan = mapSqlRowsToPlan(planRows);
+    // Phase 4: Continue Learning = new content only; reviews live in REVIEW_SERVICE.
+    const continuePlan = plan.filter((p) => !isGuidedReviewSlot(p));
+    const deferredReviews = plan.filter((p) => isGuidedReviewSlot(p));
 
     return res.json({
       success: true,
       data: {
         action: statusRow?.Action || "LOADED",
-        planDate: plan.length ? plan[0].planDate : resolvedDate,
-        totalItems: plan.length,
-        plan,
+        planDate: continuePlan.length
+          ? continuePlan[0].planDate
+          : plan.length
+            ? plan[0].planDate
+            : resolvedDate,
+        totalItems: continuePlan.length,
+        plan: continuePlan,
+        deferredReviewCount: deferredReviews.length,
+        reviewsMovedToRetention: true,
       },
     });
   } catch (error) {
@@ -197,6 +244,16 @@ const getPlanById = async (req, res) => {
         quizPassed: planRow.QUIZPASSED != null ? Boolean(planRow.QUIZPASSED) : null,
         quizScorePercent: planRow.QUIZSCOREPERCENT,
         completedAt: planRow.COMPLETEDAT,
+        progressId: planRow.PROGRESSID != null ? Number(planRow.PROGRESSID) : null,
+        leitnerBox: planRow.LEITNERBOX != null ? Number(planRow.LEITNERBOX) : null,
+        masteryLevel: planRow.MASTERYLEVEL ?? null,
+        nextReviewDate: planRow.NEXTREVIEWDATE ?? null,
+        attemptCount: planRow.ATTEMPTCOUNT != null ? Number(planRow.ATTEMPTCOUNT) : null,
+        lastQuizScore: planRow.LASTQUIZSCORE != null ? Number(planRow.LASTQUIZSCORE) : null,
+        contentIndex: planRow.CONTENTINDEX != null ? Number(planRow.CONTENTINDEX) : null,
+        lastAttemptedAt: planRow.LASTATTEMPTEDAT ?? null,
+        reviewIntervalDays:
+          planRow.REVIEWINTERVALDAYS != null ? Number(planRow.REVIEWINTERVALDAYS) : null,
       },
     });
   } catch (error) {
@@ -254,9 +311,43 @@ const updatePlanStatus = async (req, res) => {
       });
     }
 
+    const ok = rows.find((r) => r.Status === "SUCCESS" || r.ErrorCode === 0);
+    const topicUpdate =
+      ok && (ok.NewLeitnerBox != null || ok.NextReviewDate != null)
+        ? {
+            newLeitnerBox: ok.NewLeitnerBox != null ? Number(ok.NewLeitnerBox) : null,
+            newMasteryLevel: ok.NewMasteryLevel ?? null,
+            nextReviewDate: ok.NextReviewDate ?? null,
+          }
+        : null;
+
+    if (topicUpdate && status === "COMPLETED") {
+      try {
+        const planMeta = await sequelize.query(
+          `SELECT TOP 1 DLP.TOPICID, TM.TOPICNAME
+           FROM DAILY_LEARNING_PLAN DLP
+           LEFT JOIN TOPIC_MASTER TM ON TM.TOPICID = DLP.TOPICID
+           WHERE DLP.PLANID = :planId AND DLP.USERID = :userId`,
+          { replacements: { planId, userId }, type: QueryTypes.SELECT }
+        );
+        const meta = planMeta?.[0];
+        await publishTopicProgress(userId, topicUpdate, {
+          topicId: meta?.TOPICID,
+          title: meta?.TOPICNAME,
+        });
+      } catch (pubErr) {
+        console.warn("publishTopicProgress:", pubErr.message);
+      }
+    }
+
     return res.json({
       success: true,
-      data: { planId, status, message: "Plan status updated" },
+      data: {
+        planId,
+        status,
+        message: "Plan status updated",
+        topicUpdate,
+      },
     });
   } catch (error) {
     return res.status(500).json({
@@ -428,6 +519,25 @@ const submitPlanQuiz = async (req, res) => {
           nextReviewDate: progressRow.NextReviewDate,
         }
       : null;
+
+    if (topicUpdate) {
+      try {
+        const planMeta = await sequelize.query(
+          `SELECT TOP 1 DLP.TOPICID, TM.TOPICNAME
+           FROM DAILY_LEARNING_PLAN DLP
+           LEFT JOIN TOPIC_MASTER TM ON TM.TOPICID = DLP.TOPICID
+           WHERE DLP.PLANID = :planId AND DLP.USERID = :userId`,
+          { replacements: { planId, userId }, type: QueryTypes.SELECT }
+        );
+        const meta = planMeta?.[0];
+        await publishTopicProgress(userId, topicUpdate, {
+          topicId: meta?.TOPICID ?? progressRow.TOPICID,
+          title: meta?.TOPICNAME,
+        });
+      } catch (pubErr) {
+        console.warn("publishTopicProgress quiz:", pubErr.message);
+      }
+    }
 
     return res.json({
       success: true,
