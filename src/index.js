@@ -1,7 +1,9 @@
-require("dotenv").config();
+require("./config/loadEnv"); // Phase 1: APP_ENV-aware .env loader (LOCAL_/PROD_ blocks)
 const express = require("express");
 const cors = require("cors");
 const app = express();
+// S12: never send raw internal/SQL error text to clients outside development.
+app.use(require("./middleware/safeErrorResponses"));
 const sequelizeConnection = require("./config/database");
 
 const corsOrigin =

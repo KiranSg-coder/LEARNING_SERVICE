@@ -1,26 +1,15 @@
-const INTERNAL_SERVICE_KEY = process.env.INTERNAL_SERVICE_KEY;
-
+"use strict";
 /**
- * When INTERNAL_SERVICE_KEY is set, require matching x-service-key.
- * When unset (local dev), allow requests without a key.
+ * Internal endpoint guard — uses the shared dual-key helper (A7, src/lib/serviceKey.js).
+ * Fails closed (503 when INTERNAL_SERVICE_KEY is unset), constant-time comparison, and also
+ * accepts INTERNAL_SERVICE_KEY_PREVIOUS during a key rotation. Key values are never logged.
  */
-const internalServiceAuth = (req, res, next) => {
-  if (!INTERNAL_SERVICE_KEY) {
-    return next();
-  }
+const serviceKey = require("../lib/serviceKey");
 
-  const sent = req.headers["x-service-key"];
-  if (sent !== INTERNAL_SERVICE_KEY) {
-    return res.status(401).json({
-      success: false,
-      error: {
-        code: "UNAUTHORIZED",
-        message: "Invalid or missing x-service-key",
-      },
-    });
-  }
+function requireServiceKey(req, res, next) {
+  return serviceKey.requireServiceKey(req, res, next);
+}
 
-  next();
-};
-
-module.exports = internalServiceAuth;
+module.exports = requireServiceKey;
+module.exports.requireServiceKey = requireServiceKey;
+module.exports.internalServiceAuth = requireServiceKey;
